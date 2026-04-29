@@ -361,14 +361,19 @@ jobs:
   # Job 6: Docker Build & Push
   # ---------------------------------------------------------------------------
   docker-build:
-    needs: [setup, unit-tests, integration-tests, quality-checks]
+    needs: [setup, unit-tests, integration-tests, quality-checks, sonarqube]
     runs-on: ubuntu-latest
     timeout-minutes: 30
     if: |
-      github.ref == 'refs/heads/main' ||
-      github.ref == 'refs/heads/develop' ||
-      startsWith(github.ref, 'refs/heads/release/') ||
-      github.event.inputs.force_docker_build == 'true'
+      always() &&
+      !contains(needs.*.result, 'failure') &&
+      (needs.sonarqube.result == 'success' || needs.sonarqube.result == 'skipped') &&
+      (
+        github.ref == 'refs/heads/main' ||
+        github.ref == 'refs/heads/develop' ||
+        startsWith(github.ref, 'refs/heads/release/') ||
+        github.event.inputs.force_docker_build == 'true'
+      )
     steps:
       - name: Checkout
         uses: actions/checkout@v4
