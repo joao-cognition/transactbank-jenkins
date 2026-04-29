@@ -351,19 +351,20 @@ jobs:
           REGISTRY_URL: ${{ secrets.DOCKER_REGISTRY }}
           REPLICAS: ${{ steps.env.outputs.replicas }}
           ENVIRONMENT: ${{ env.TARGET_ENV }}
+          NAMESPACE: transactbank
         run: |
-          envsubst < kubernetes/deployment.yaml | kubectl apply -f - -n ${{ env.APP_NAME }}
-          envsubst < kubernetes/service.yaml    | kubectl apply -f - -n ${{ env.APP_NAME }}
-          envsubst < kubernetes/configmap.yaml  | kubectl apply -f - -n ${{ env.APP_NAME }}
+          envsubst < kubernetes/deployment.yaml | kubectl apply -f - -n transactbank
+          envsubst < kubernetes/service.yaml    | kubectl apply -f - -n transactbank
+          envsubst < kubernetes/configmap.yaml  | kubectl apply -f - -n transactbank
           kubectl rollout status deployment/${{ env.APP_NAME }} \
-            -n ${{ env.APP_NAME }} --timeout=300s
+            -n transactbank --timeout=300s
 
       - name: Health check
         run: |
           MAX_RETRIES=10
           RETRY_INTERVAL=5
           for i in $(seq 1 $MAX_RETRIES); do
-            HEALTH=$(kubectl exec -n ${{ env.APP_NAME }} \
+            HEALTH=$(kubectl exec -n transactbank \
               deploy/${{ env.APP_NAME }} -- \
               curl -sf http://localhost:5000/health 2>/dev/null || true)
             if echo "$HEALTH" | grep -q healthy; then
