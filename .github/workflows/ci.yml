@@ -318,7 +318,7 @@ jobs:
     needs: [setup-and-test, docker]
     if: |
       inputs.deploy_env == 'dev' || inputs.deploy_env == 'staging' ||
-      (github.ref == 'refs/heads/develop' && inputs.deploy_env == 'none')
+      (github.ref == 'refs/heads/develop' && inputs.deploy_env != 'dev' && inputs.deploy_env != 'staging')
     environment: ${{ (inputs.deploy_env != 'none' && inputs.deploy_env != '') && inputs.deploy_env || 'dev' }}
     env:
       GIT_COMMIT_SHORT: ${{ needs.setup-and-test.outputs.git_commit_short }}
