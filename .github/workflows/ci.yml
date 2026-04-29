@@ -255,12 +255,18 @@ jobs:
   docker:
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    needs: [setup-and-test, quality-checks]
+    needs: [setup-and-test, quality-checks, sonarqube]
     if: |
-      github.ref == 'refs/heads/main' ||
-      github.ref == 'refs/heads/develop' ||
-      startsWith(github.ref, 'refs/heads/release/') ||
-      inputs.force_docker_build == true
+      always() &&
+      needs.setup-and-test.result == 'success' &&
+      needs.quality-checks.result == 'success' &&
+      (needs.sonarqube.result == 'success' || needs.sonarqube.result == 'skipped') &&
+      (
+        github.ref == 'refs/heads/main' ||
+        github.ref == 'refs/heads/develop' ||
+        startsWith(github.ref, 'refs/heads/release/') ||
+        inputs.force_docker_build == true
+      )
     env:
       GIT_COMMIT_SHORT: ${{ needs.setup-and-test.outputs.git_commit_short }}
       DOCKER_TAG: ${{ needs.setup-and-test.outputs.docker_tag }}
