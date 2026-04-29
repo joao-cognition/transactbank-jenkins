@@ -68,12 +68,13 @@ jobs:
 
       - name: Compute build variables
         id: vars
+        env:
+          TAG_OVERRIDE: ${{ inputs.docker_tag_override }}
         run: |
           GIT_COMMIT_SHORT=$(git rev-parse --short HEAD)
           echo "git_commit_short=${GIT_COMMIT_SHORT}" >> "$GITHUB_OUTPUT"
 
           BRANCH_CLEAN=$(echo "${GITHUB_REF_NAME}" | sed 's|/|-|g')
-          TAG_OVERRIDE="${{ inputs.docker_tag_override }}"
           DOCKER_TAG=${TAG_OVERRIDE:-${BRANCH_CLEAN}-${GIT_COMMIT_SHORT}}
           echo "docker_tag=${DOCKER_TAG}" >> "$GITHUB_OUTPUT"
 
@@ -291,6 +292,10 @@ jobs:
             VCS_REF=${{ env.GIT_COMMIT_SHORT }}
           labels: |
             org.opencontainers.image.revision=${{ env.GIT_COMMIT_SHORT }}
+
+      - name: Create reports directory
+        if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop'
+        run: mkdir -p reports
 
       - name: Trivy Security Scan
         if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop'
