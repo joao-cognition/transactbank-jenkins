@@ -309,7 +309,7 @@ jobs:
 
       - name: Trivy Security Scan
         if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop'
-        uses: aquasecurity/trivy-action@master
+        uses: aquasecurity/trivy-action@0.31.0
         with:
           image-ref: '${{ secrets.DOCKER_REGISTRY }}/${{ env.APP_NAME }}:${{ env.DOCKER_TAG }}'
           format: json
