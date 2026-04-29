@@ -1,0 +1,429 @@
+# =============================================================================
+# TransactBank API — GitHub Actions CI Pipeline
+#
+# Migrated from Jenkinsfile (365 lines). Replicates all stages:
+#   Checkout → Lint (parallel matrix) → Unit Tests → Integration Tests →
+#   SonarQube → Docker Build → Trivy Scan → Deploy → Slack Notify
+#
+# Required repository secrets:
+#   DOCKER_REGISTRY, DOCKER_REGISTRY_USERNAME, DOCKER_REGISTRY_PASSWORD
+#   SONAR_TOKEN, SONAR_HOST_URL, SLACK_WEBHOOK_URL
+#
+# Per-environment secrets (GitHub Environments: dev, staging):
+#   K8S_KUBECONFIG (base64-encoded)
+# =============================================================================
+
+name: CI Pipeline
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      deploy_env:
+        type: choice
+        options: ['none', 'dev', 'staging']
+        default: 'none'
+        description: 'Target deployment environment'
+      skip_sonar:
+        type: boolean
+        default: false
+        description: 'Skip SonarQube analysis'
+      force_docker_build:
+        type: boolean
+        default: false
+        description: 'Build Docker image even on feature branches'
+      docker_tag_override:
+        type: string
+        default: ''
+        description: 'Override Docker image tag'
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  APP_NAME: transactbank-api
+  PYTHON_VERSION: '3.11'
+
+# -----------------------------------------------------------------------------
+# Job 1: Setup, Unit Tests, and Integration Tests
+# -----------------------------------------------------------------------------
+jobs:
+  setup-and-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      git_commit_short: ${{ steps.vars.outputs.git_commit_short }}
+      docker_tag: ${{ steps.vars.outputs.docker_tag }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Compute build variables
+        id: vars
+        run: |
+          GIT_COMMIT_SHORT=$(git rev-parse --short HEAD)
+          echo "git_commit_short=${GIT_COMMIT_SHORT}" >> "$GITHUB_OUTPUT"
+
+          BRANCH_CLEAN=$(echo "${GITHUB_REF_NAME}" | sed 's|/|-|g')
+          TAG_OVERRIDE="${{ inputs.docker_tag_override }}"
+          DOCKER_TAG=${TAG_OVERRIDE:-${BRANCH_CLEAN}-${GIT_COMMIT_SHORT}}
+          echo "docker_tag=${DOCKER_TAG}" >> "$GITHUB_OUTPUT"
+
+          echo "GIT_COMMIT_SHORT=${GIT_COMMIT_SHORT}" >> "$GITHUB_ENV"
+          echo "DOCKER_TAG=${DOCKER_TAG}" >> "$GITHUB_ENV"
+
+          echo "Building ${APP_NAME} @ ${GIT_COMMIT_SHORT} on ${BRANCH_CLEAN}"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt -r requirements-dev.txt
+
+      - name: Unit tests
+        env:
+          FLASK_ENV: testing
+          DATABASE_URL: sqlite:///test.db
+        run: |
+          mkdir -p reports
+          pytest tests/unit/ -v --tb=short \
+            --junitxml=reports/unit-test-results.xml \
+            --cov=app --cov-report=xml:reports/coverage.xml \
+            --cov-report=html:reports/coverage-html \
+            --cov-fail-under=75
+
+      - name: Integration tests
+        env:
+          FLASK_ENV: testing
+          DATABASE_URL: sqlite:///test.db
+        run: |
+          pytest tests/integration/ -v --tb=short \
+            --junitxml=reports/integration-test-results.xml
+
+      - name: Publish test results
+        uses: dorny/test-reporter@v1
+        if: always()
+        with:
+          name: Test Results
+          path: reports/*-test-results.xml
+          reporter: java-junit
+
+      - name: Code coverage summary (PR only)
+        if: github.event_name == 'pull_request'
+        uses: irongut/CodeCoverageSummary@v1.3.0
+        with:
+          filename: reports/coverage.xml
+          badge: true
+          format: markdown
+          output: both
+
+      - name: Add coverage comment to PR
+        if: github.event_name == 'pull_request'
+        uses: marocchino/sticky-pull-request-comment@v2
+        with:
+          path: code-coverage-results.md
+
+      - name: Upload reports
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-reports
+          path: reports/
+
+  # ---------------------------------------------------------------------------
+  # Job 2: Quality Checks (parallel matrix — flake8, pylint, mypy, bandit)
+  # ---------------------------------------------------------------------------
+  quality-checks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        check: [flake8, pylint, mypy, bandit]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt -r requirements-dev.txt
+
+      - name: Run flake8
+        if: matrix.check == 'flake8'
+        run: |
+          mkdir -p reports
+          flake8 app/ tests/ \
+            --format=pylint \
+            --output-file=reports/flake8-report.txt \
+            --statistics --count || true
+
+      - name: Run pylint
+        if: matrix.check == 'pylint'
+        run: |
+          mkdir -p reports
+          pylint app/ --output-format=parseable --reports=yes \
+            --rcfile=.pylintrc > reports/pylint-report.txt || true
+
+      - name: Run mypy
+        if: matrix.check == 'mypy'
+        run: |
+          mypy app/ --ignore-missing-imports --html-report reports/mypy || true
+
+      - name: Run bandit
+        if: matrix.check == 'bandit'
+        run: |
+          mkdir -p reports
+          bandit -r app/ -f json -o reports/bandit-report.json \
+            --severity-level medium || true
+
+      - name: Upload quality report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: quality-${{ matrix.check }}
+          path: reports/
+
+  # ---------------------------------------------------------------------------
+  # Job 3: SonarQube Analysis
+  # ---------------------------------------------------------------------------
+  sonarqube:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: [setup-and-test, quality-checks]
+    if: inputs.skip_sonar != true
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download test reports
+        uses: actions/download-artifact@v4
+        with:
+          name: test-reports
+          path: reports/
+
+      - name: Download flake8 report
+        uses: actions/download-artifact@v4
+        with:
+          name: quality-flake8
+          path: reports/
+        continue-on-error: true
+
+      - name: Download pylint report
+        uses: actions/download-artifact@v4
+        with:
+          name: quality-pylint
+          path: reports/
+        continue-on-error: true
+
+      - name: SonarQube Scan
+        uses: SonarSource/sonarqube-scan-action@v5
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+        with:
+          args: >
+            -Dsonar.projectVersion=${{ needs.setup-and-test.outputs.docker_tag }}
+
+      - name: SonarQube Quality Gate
+        uses: SonarSource/sonarqube-quality-gate-action@v1
+        timeout-minutes: 5
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+
+  # ---------------------------------------------------------------------------
+  # Job 4: Docker Build & Push
+  # ---------------------------------------------------------------------------
+  docker:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: [setup-and-test, quality-checks]
+    if: |
+      github.ref == 'refs/heads/main' ||
+      github.ref == 'refs/heads/develop' ||
+      startsWith(github.ref, 'refs/heads/release/') ||
+      inputs.force_docker_build == true
+    env:
+      GIT_COMMIT_SHORT: ${{ needs.setup-and-test.outputs.git_commit_short }}
+      DOCKER_TAG: ${{ needs.setup-and-test.outputs.docker_tag }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Docker Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ secrets.DOCKER_REGISTRY }}
+          username: ${{ secrets.DOCKER_REGISTRY_USERNAME }}
+          password: ${{ secrets.DOCKER_REGISTRY_PASSWORD }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ secrets.DOCKER_REGISTRY }}/${{ env.APP_NAME }}:${{ env.DOCKER_TAG }}
+            ${{ secrets.DOCKER_REGISTRY }}/${{ env.APP_NAME }}:latest
+          build-args: |
+            PYTHON_VERSION=${{ env.PYTHON_VERSION }}
+            BUILD_DATE=${{ github.event.head_commit.timestamp }}
+            VCS_REF=${{ env.GIT_COMMIT_SHORT }}
+          labels: |
+            org.opencontainers.image.revision=${{ env.GIT_COMMIT_SHORT }}
+
+      - name: Trivy Security Scan
+        if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop'
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: '${{ secrets.DOCKER_REGISTRY }}/${{ env.APP_NAME }}:${{ env.DOCKER_TAG }}'
+          format: json
+          output: reports/trivy-report.json
+          severity: HIGH,CRITICAL
+        continue-on-error: true
+
+      - name: Upload Trivy report
+        if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop'
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-report
+          path: reports/trivy-report.json
+
+  # ---------------------------------------------------------------------------
+  # Job 5: Deploy to Kubernetes
+  # ---------------------------------------------------------------------------
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: [setup-and-test, docker]
+    if: |
+      inputs.deploy_env == 'dev' || inputs.deploy_env == 'staging' ||
+      (github.ref == 'refs/heads/develop' && inputs.deploy_env == 'none')
+    environment: ${{ (inputs.deploy_env != 'none' && inputs.deploy_env != '') && inputs.deploy_env || 'dev' }}
+    env:
+      GIT_COMMIT_SHORT: ${{ needs.setup-and-test.outputs.git_commit_short }}
+      DOCKER_TAG: ${{ needs.setup-and-test.outputs.docker_tag }}
+      TARGET_ENV: ${{ (inputs.deploy_env != 'none' && inputs.deploy_env != '') && inputs.deploy_env || 'dev' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Determine replicas
+        id: env
+        run: |
+          if [ "${{ env.TARGET_ENV }}" = "dev" ]; then
+            echo "replicas=1" >> "$GITHUB_OUTPUT"
+          elif [ "${{ env.TARGET_ENV }}" = "staging" ]; then
+            echo "replicas=2" >> "$GITHUB_OUTPUT"
+          else
+            echo "replicas=1" >> "$GITHUB_OUTPUT"
+          fi
+          echo "Deploying to ${{ env.TARGET_ENV }}"
+
+      - name: Configure kubectl
+        run: |
+          echo "${{ secrets.K8S_KUBECONFIG }}" | base64 -d > /tmp/kubeconfig
+          echo "KUBECONFIG=/tmp/kubeconfig" >> "$GITHUB_ENV"
+
+      - name: Deploy to Kubernetes
+        env:
+          IMAGE_TAG: ${{ env.DOCKER_TAG }}
+          REGISTRY_URL: ${{ secrets.DOCKER_REGISTRY }}
+          REPLICAS: ${{ steps.env.outputs.replicas }}
+          ENVIRONMENT: ${{ env.TARGET_ENV }}
+        run: |
+          envsubst < kubernetes/deployment.yaml | kubectl apply -f - -n ${{ env.APP_NAME }}
+          envsubst < kubernetes/service.yaml    | kubectl apply -f - -n ${{ env.APP_NAME }}
+          envsubst < kubernetes/configmap.yaml  | kubectl apply -f - -n ${{ env.APP_NAME }}
+          kubectl rollout status deployment/${{ env.APP_NAME }} \
+            -n ${{ env.APP_NAME }} --timeout=300s
+
+      - name: Health check
+        run: |
+          MAX_RETRIES=10
+          RETRY_INTERVAL=5
+          for i in $(seq 1 $MAX_RETRIES); do
+            HEALTH=$(kubectl exec -n ${{ env.APP_NAME }} \
+              deploy/${{ env.APP_NAME }} -- \
+              curl -sf http://localhost:5000/health 2>/dev/null || true)
+            if echo "$HEALTH" | grep -q healthy; then
+              echo "Deployment verified healthy after $i attempts"
+              exit 0
+            fi
+            echo "Attempt $i/$MAX_RETRIES — waiting..."
+            sleep $RETRY_INTERVAL
+          done
+          echo "ERROR: Deployment health check failed after $MAX_RETRIES attempts"
+          exit 1
+
+      - name: Cleanup kubeconfig
+        if: always()
+        run: rm -f /tmp/kubeconfig
+
+  # ---------------------------------------------------------------------------
+  # Job 6: Slack Notification
+  # ---------------------------------------------------------------------------
+  notify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    needs: [setup-and-test, quality-checks, sonarqube, docker, deploy]
+    if: always()
+    steps:
+      - name: Determine pipeline status
+        id: status
+        run: |
+          # Collect results from all upstream jobs
+          RESULTS="${{ needs.setup-and-test.result }} ${{ needs.quality-checks.result }} ${{ needs.sonarqube.result }} ${{ needs.docker.result }} ${{ needs.deploy.result }}"
+
+          if echo "$RESULTS" | grep -q "failure"; then
+            echo "status=FAILURE" >> "$GITHUB_OUTPUT"
+            echo "color=#dc3545"  >> "$GITHUB_OUTPUT"
+            echo "emoji=:x:"     >> "$GITHUB_OUTPUT"
+          elif echo "$RESULTS" | grep -q "cancelled"; then
+            echo "status=CANCELLED" >> "$GITHUB_OUTPUT"
+            echo "color=#6c757d"    >> "$GITHUB_OUTPUT"
+            echo "emoji=:no_entry:" >> "$GITHUB_OUTPUT"
+          else
+            echo "status=SUCCESS" >> "$GITHUB_OUTPUT"
+            echo "color=#28a745"  >> "$GITHUB_OUTPUT"
+            echo "emoji=:white_check_mark:" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Send Slack notification
+        uses: slackapi/slack-github-action@v2
+        with:
+          webhook: ${{ secrets.SLACK_WEBHOOK_URL }}
+          webhook-type: incoming-webhook
+          payload: |
+            {
+              "channel": "#transactbank-ci",
+              "attachments": [
+                {
+                  "color": "${{ steps.status.outputs.color }}",
+                  "blocks": [
+                    {
+                      "type": "section",
+                      "text": {
+                        "type": "mrkdwn",
+                        "text": "${{ steps.status.outputs.emoji }} *${{ env.APP_NAME }}* pipeline — *${{ steps.status.outputs.status }}*\n*Branch:* `${{ github.ref_name }}`\n*Commit:* `${{ github.sha }}`\n*Triggered by:* ${{ github.actor }}\n<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View workflow run>"
+                      }
+                    }
+                  ]
+                }
+              ]
+            }
