@@ -1,0 +1,214 @@
+/**
+ * TransactBank API — Nightly Build Pipeline
+ *
+ * Runs every night at 2:00 AM UTC.
+ * Full regression suite, dependency audit, OWASP scan, and performance baseline.
+ *
+ * Results are published to Jenkins and emailed to the team.
+ */
+
+@Library('transactbank-shared-lib') _
+
+pipeline {
+    agent {
+        docker {
+            image 'python:3.11-slim'
+            args '-v /var/run/docker.sock:/var/run/docker.sock --network host'
+            label 'docker-agent'
+        }
+    }
+
+    options {
+        timeout(time: 60, unit: 'MINUTES')
+        timestamps()
+        ansiColor('xterm')
+        buildDiscarder(logRotator(numToKeepStr: '30'))
+    }
+
+    triggers {
+        cron('H 2 * * *')
+    }
+
+    environment {
+        APP_NAME     = 'transactbank-api'
+        VENV_DIR     = "${WORKSPACE}/.venv"
+        PATH         = "${VENV_DIR}/bin:${PATH}"
+        DATABASE_URL = "sqlite:///${WORKSPACE}/nightly-test.db"
+        FLASK_ENV    = 'testing'
+        SLACK_CHANNEL = '#transactbank-ci'
+    }
+
+    stages {
+        stage('Setup') {
+            steps {
+                checkout scm
+                sh '''
+                    python -m venv ${VENV_DIR}
+                    . ${VENV_DIR}/bin/activate
+                    pip install --upgrade pip
+                    pip install -r requirements.txt
+                    pip install -r requirements-dev.txt
+                '''
+            }
+        }
+
+        stage('Full Regression Suite') {
+            steps {
+                sh '''
+                    . ${VENV_DIR}/bin/activate
+                    mkdir -p reports
+                    pytest tests/ \
+                        -v \
+                        --tb=long \
+                        --junitxml=reports/nightly-test-results.xml \
+                        --cov=app \
+                        --cov-report=xml:reports/nightly-coverage.xml \
+                        --cov-report=html:reports/nightly-coverage-html \
+                        --cov-fail-under=80
+                '''
+            }
+            post {
+                always {
+                    junit 'reports/nightly-test-results.xml'
+                    cobertura coberturaReportFile: 'reports/nightly-coverage.xml'
+                    publishHTML(target: [
+                        reportDir: 'reports/nightly-coverage-html',
+                        reportFiles: 'index.html',
+                        reportName: 'Nightly Coverage Report',
+                    ])
+                }
+            }
+        }
+
+        stage('Dependency Audit') {
+            steps {
+                sh '''
+                    . ${VENV_DIR}/bin/activate
+                    mkdir -p reports
+
+                    # pip-audit for known vulnerabilities
+                    pip-audit \
+                        --format json \
+                        --output reports/pip-audit-report.json \
+                        || true
+
+                    # safety check (legacy — some orgs still use it)
+                    safety check \
+                        --json \
+                        --output reports/safety-report.json \
+                        || true
+
+                    # Check for outdated packages
+                    pip list --outdated --format=json > reports/outdated-packages.json || true
+                '''
+                archiveArtifacts artifacts: 'reports/pip-audit-report.json,reports/safety-report.json,reports/outdated-packages.json', allowEmptyArchive: true
+            }
+        }
+
+        stage('OWASP Dependency Check') {
+            steps {
+                dependencyCheck(
+                    additionalArguments: '''
+                        --scan .
+                        --format JSON
+                        --format HTML
+                        --out reports/owasp
+                        --project "TransactBank API"
+                        --enableExperimental
+                    ''',
+                    odcInstallation: 'OWASP-DC'
+                )
+                dependencyCheckPublisher pattern: 'reports/owasp/dependency-check-report.json'
+                publishHTML(target: [
+                    reportDir: 'reports/owasp',
+                    reportFiles: 'dependency-check-report.html',
+                    reportName: 'OWASP Dependency Check',
+                ])
+            }
+        }
+
+        stage('Performance Baseline') {
+            steps {
+                sh '''
+                    . ${VENV_DIR}/bin/activate
+                    mkdir -p reports
+
+                    # Run the app in background for load testing
+                    FLASK_ENV=testing python wsgi.py &
+                    APP_PID=$!
+                    sleep 5
+
+                    # Simple load test with built-in tools
+                    python jenkins/scripts/load_test.py \
+                        --base-url http://localhost:5000 \
+                        --duration 30 \
+                        --concurrency 10 \
+                        --output reports/perf-baseline.json
+
+                    kill $APP_PID || true
+                '''
+                archiveArtifacts artifacts: 'reports/perf-baseline.json', allowEmptyArchive: true
+            }
+        }
+
+        stage('License Compliance') {
+            steps {
+                sh '''
+                    . ${VENV_DIR}/bin/activate
+                    pip-licenses \
+                        --format=json \
+                        --with-urls \
+                        --output-file=reports/licenses.json
+
+                    # Check for copyleft licenses
+                    python -c "
+import json, sys
+with open('reports/licenses.json') as f:
+    pkgs = json.load(f)
+banned = ['GPL', 'AGPL', 'LGPL']
+violations = [p for p in pkgs if any(b in p.get('License', '') for b in banned)]
+if violations:
+    print('LICENSE VIOLATIONS FOUND:')
+    for v in violations:
+        print(f'  {v[\"Name\"]} - {v[\"License\"]}')
+    sys.exit(1)
+print('All licenses OK')
+"
+                '''
+            }
+        }
+    }
+
+    post {
+        always {
+            archiveArtifacts artifacts: 'reports/**', allowEmptyArchive: true
+            cleanWs()
+        }
+        failure {
+            notifySlack(
+                channel: env.SLACK_CHANNEL,
+                status: 'FAILURE',
+                message: "Nightly build *${APP_NAME}* FAILED. <${BUILD_URL}|View logs>",
+            )
+            emailext(
+                subject: "[NIGHTLY FAILURE] TransactBank API - Build #${BUILD_NUMBER}",
+                body: '''Nightly regression suite failed.
+
+Build: ${BUILD_URL}
+Branch: ${BRANCH_NAME}
+
+Please investigate.
+''',
+                recipientProviders: [culprits(), requestor()],
+                to: 'transactbank-team@company.com',
+            )
+        }
+        success {
+            notifySlack(
+                channel: env.SLACK_CHANNEL,
+                status: 'SUCCESS',
+                message: "Nightly build *${APP_NAME}* passed all checks.",
+            )
+        }
+    }
+}

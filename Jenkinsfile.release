@@ -1,0 +1,233 @@
+/**
+ * TransactBank API — Release Pipeline
+ *
+ * Manually triggered to cut a new release.
+ * Handles: version bump, changelog generation, Git tagging,
+ * Docker image promotion, and production deployment.
+ *
+ * Only accessible by release-managers group.
+ */
+
+@Library('transactbank-shared-lib') _
+
+pipeline {
+    agent {
+        label 'deploy-agent'
+    }
+
+    options {
+        timeout(time: 60, unit: 'MINUTES')
+        timestamps()
+        ansiColor('xterm')
+    }
+
+    environment {
+        APP_NAME        = 'transactbank-api'
+        DOCKER_REGISTRY = credentials('docker-registry-url')
+        SLACK_CHANNEL   = '#transactbank-releases'
+        GIT_CREDENTIALS = credentials('github-deploy-key')
+    }
+
+    parameters {
+        choice(
+            name: 'RELEASE_TYPE',
+            choices: ['patch', 'minor', 'major'],
+            description: 'Semantic versioning bump type'
+        )
+        string(
+            name: 'SOURCE_TAG',
+            defaultValue: '',
+            description: 'Docker image tag to promote (e.g., develop-abc1234)'
+        )
+        text(
+            name: 'RELEASE_NOTES',
+            defaultValue: '',
+            description: 'Release notes (Markdown format)'
+        )
+        booleanParam(
+            name: 'DEPLOY_TO_PRODUCTION',
+            defaultValue: false,
+            description: 'Automatically deploy to production after tagging'
+        )
+    }
+
+    stages {
+        stage('Validate') {
+            steps {
+                script {
+                    if (!params.SOURCE_TAG?.trim()) {
+                        error("SOURCE_TAG is required. Provide the image tag to promote.")
+                    }
+
+                    // Require approval from release managers
+                    timeout(time: 10, unit: 'MINUTES') {
+                        input(
+                            message: "Create ${params.RELEASE_TYPE} release from ${params.SOURCE_TAG}?",
+                            submitter: 'release-managers',
+                        )
+                    }
+                }
+            }
+        }
+
+        stage('Calculate Version') {
+            steps {
+                checkout scm
+                script {
+                    // Read current version from app/__init__.py
+                    def currentVersion = sh(
+                        script: "grep '__version__' app/__init__.py | cut -d'\"' -f2",
+                        returnStdout: true
+                    ).trim()
+
+                    def parts = currentVersion.tokenize('.')
+                    def major = parts[0].toInteger()
+                    def minor = parts[1].toInteger()
+                    def patch = parts[2].toInteger()
+
+                    switch (params.RELEASE_TYPE) {
+                        case 'major':
+                            major++; minor = 0; patch = 0; break
+                        case 'minor':
+                            minor++; patch = 0; break
+                        case 'patch':
+                            patch++; break
+                    }
+
+                    env.NEW_VERSION = "${major}.${minor}.${patch}"
+                    env.CURRENT_VERSION = currentVersion
+
+                    echo "Version bump: ${currentVersion} → ${env.NEW_VERSION}"
+                }
+            }
+        }
+
+        stage('Run Release Tests') {
+            agent {
+                docker {
+                    image 'python:3.11-slim'
+                    args '--network host'
+                }
+            }
+            steps {
+                sh '''
+                    python -m venv .venv
+                    . .venv/bin/activate
+                    pip install -r requirements.txt -r requirements-dev.txt
+                    DATABASE_URL="sqlite:///release-test.db" \
+                    FLASK_ENV=testing \
+                    pytest tests/ -v --tb=short
+                '''
+            }
+        }
+
+        stage('Bump Version & Changelog') {
+            steps {
+                sshagent(credentials: ['github-deploy-key']) {
+                    sh """
+                        # Update version in source
+                        sed -i 's/__version__ = "${CURRENT_VERSION}"/__version__ = "${NEW_VERSION}"/' app/__init__.py
+
+                        # Generate changelog entry
+                        cat >> CHANGELOG.md << 'CHANGELOG_EOF'
+
+## [${NEW_VERSION}] - \$(date +%Y-%m-%d)
+
+${RELEASE_NOTES ?: 'No release notes provided.'}
+
+### Changes
+\$(git log --oneline v${CURRENT_VERSION}..HEAD 2>/dev/null || git log --oneline -20)
+CHANGELOG_EOF
+
+                        # Commit and tag
+                        git config user.email "jenkins@company.com"
+                        git config user.name "Jenkins Release Bot"
+                        git add app/__init__.py CHANGELOG.md
+                        git commit -m "chore(release): bump version to ${NEW_VERSION}"
+                        git tag -a "v${NEW_VERSION}" -m "Release ${NEW_VERSION}"
+                        git push origin HEAD
+                        git push origin "v${NEW_VERSION}"
+                    """
+                }
+            }
+        }
+
+        stage('Promote Docker Image') {
+            steps {
+                script {
+                    docker.withRegistry("https://${DOCKER_REGISTRY}", 'docker-registry-credentials') {
+                        def sourceImage = docker.image("${DOCKER_REGISTRY}/${APP_NAME}:${params.SOURCE_TAG}")
+                        sourceImage.pull()
+
+                        // Tag with version and latest
+                        sh """
+                            docker tag \
+                                ${DOCKER_REGISTRY}/${APP_NAME}:${params.SOURCE_TAG} \
+                                ${DOCKER_REGISTRY}/${APP_NAME}:v${NEW_VERSION}
+
+                            docker tag \
+                                ${DOCKER_REGISTRY}/${APP_NAME}:${params.SOURCE_TAG} \
+                                ${DOCKER_REGISTRY}/${APP_NAME}:latest
+                        """
+
+                        docker.image("${DOCKER_REGISTRY}/${APP_NAME}:v${NEW_VERSION}").push()
+                        docker.image("${DOCKER_REGISTRY}/${APP_NAME}:latest").push()
+                    }
+                }
+            }
+        }
+
+        stage('Create GitHub Release') {
+            steps {
+                withCredentials([string(credentialsId: 'github-token', variable: 'GITHUB_TOKEN')]) {
+                    sh """
+                        curl -s -X POST \
+                            -H "Authorization: token \${GITHUB_TOKEN}" \
+                            -H "Content-Type: application/json" \
+                            "https://api.github.com/repos/\${GIT_URL##*/}/releases" \
+                            -d '{
+                                "tag_name": "v${NEW_VERSION}",
+                                "name": "v${NEW_VERSION}",
+                                "body": ${groovy.json.JsonOutput.toJson(params.RELEASE_NOTES ?: "Release ${env.NEW_VERSION}")},
+                                "draft": false,
+                                "prerelease": false
+                            }'
+                    """
+                }
+            }
+        }
+
+        stage('Deploy to Production') {
+            when {
+                expression { return params.DEPLOY_TO_PRODUCTION }
+            }
+            steps {
+                build(
+                    job: 'TransactBank-CD',
+                    parameters: [
+                        string(name: 'ENVIRONMENT', value: 'production'),
+                        string(name: 'IMAGE_TAG', value: "v${env.NEW_VERSION}"),
+                    ],
+                    wait: true,
+                )
+            }
+        }
+    }
+
+    post {
+        success {
+            notifySlack(
+                channel: env.SLACK_CHANNEL,
+                status: 'SUCCESS',
+                message: "Released *${APP_NAME}* `v${env.NEW_VERSION}` (${params.RELEASE_TYPE} bump from ${env.CURRENT_VERSION}). ${params.DEPLOY_TO_PRODUCTION ? 'Deployed to production.' : ''}",
+            )
+        }
+        failure {
+            notifySlack(
+                channel: env.SLACK_CHANNEL,
+                status: 'FAILURE',
+                message: "FAILED to release *${APP_NAME}* `v${env.NEW_VERSION}`. <${BUILD_URL}|View logs>",
+            )
+        }
+    }
+}
