@@ -1,0 +1,12 @@
+Database migration directory.
+
+Managed by Flask-Migrate (Alembic).
+
+Generate a new migration:
+    flask db migrate -m "description"
+
+Apply migrations:
+    flask db upgrade
+
+Rollback:
+    flask db downgrade

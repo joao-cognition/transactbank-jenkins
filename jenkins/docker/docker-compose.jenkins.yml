@@ -1,0 +1,60 @@
+# Docker Compose file for Jenkins CI environment.
+# Spins up the full stack needed for integration testing.
+#
+# Usage (from Jenkins pipeline):
+#   docker-compose -f jenkins/docker/docker-compose.jenkins.yml up -d
+#   ... run tests ...
+#   docker-compose -f jenkins/docker/docker-compose.jenkins.yml down -v
+
+version: "3.8"
+
+services:
+  db-test:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_DB: transactbank_test
+      POSTGRES_USER: transactbank
+      POSTGRES_PASSWORD: transactbank
+    ports:
+      - "5433:5432"
+    volumes:
+      - pgdata-test:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U transactbank -d transactbank_test"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis-test:
+    image: redis:7-alpine
+    ports:
+      - "6380:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  api-test:
+    build:
+      context: ../../
+      dockerfile: Dockerfile
+    environment:
+      FLASK_ENV: testing
+      DATABASE_URL: postgresql://transactbank:transactbank@db-test:5432/transactbank_test
+      REDIS_URL: redis://redis-test:6379/0
+    ports:
+      - "5001:5000"
+    depends_on:
+      db-test:
+        condition: service_healthy
+      redis-test:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  pgdata-test:

@@ -1,0 +1,269 @@
+/**
+ * TransactBank API — Continuous Delivery Pipeline
+ *
+ * Triggered manually or by upstream CI build completion.
+ * Handles blue/green deployment, smoke tests, and rollback.
+ *
+ * Required credentials:
+ *   - k8s-kubeconfig-{env}     — Kubernetes config per environment
+ *   - docker-registry-url       — Container registry
+ *   - slack-webhook-url          — Notification webhook
+ *   - datadog-api-key            — Monitoring integration
+ */
+
+@Library('transactbank-shared-lib') _
+
+pipeline {
+    agent {
+        label 'deploy-agent'
+    }
+
+    options {
+        timeout(time: 45, unit: 'MINUTES')
+        disableConcurrentBuilds()
+        timestamps()
+        ansiColor('xterm')
+    }
+
+    environment {
+        APP_NAME        = 'transactbank-api'
+        DOCKER_REGISTRY = credentials('docker-registry-url')
+        SLACK_CHANNEL   = '#transactbank-deploys'
+        KUBE_NAMESPACE  = 'transactbank'
+    }
+
+    parameters {
+        choice(
+            name: 'ENVIRONMENT',
+            choices: ['dev', 'staging', 'production'],
+            description: 'Target deployment environment'
+        )
+        string(
+            name: 'IMAGE_TAG',
+            defaultValue: 'latest',
+            description: 'Docker image tag to deploy'
+        )
+        booleanParam(
+            name: 'SKIP_SMOKE_TESTS',
+            defaultValue: false,
+            description: 'Skip post-deployment smoke tests'
+        )
+        booleanParam(
+            name: 'DRY_RUN',
+            defaultValue: false,
+            description: 'Preview deployment changes without applying'
+        )
+    }
+
+    stages {
+        stage('Validate Parameters') {
+            steps {
+                script {
+                    if (params.ENVIRONMENT == 'production') {
+                        // Production deployments require manual approval
+                        timeout(time: 15, unit: 'MINUTES') {
+                            input(
+                                message: "Deploy ${APP_NAME}:${params.IMAGE_TAG} to PRODUCTION?",
+                                submitter: 'release-managers,platform-leads',
+                                parameters: [
+                                    string(
+                                        name: 'APPROVAL_REASON',
+                                        defaultValue: '',
+                                        description: 'Reason for production deployment'
+                                    )
+                                ]
+                            )
+                        }
+                    }
+
+                    echo "Deploying ${APP_NAME}:${params.IMAGE_TAG} to ${params.ENVIRONMENT}"
+                }
+            }
+        }
+
+        stage('Pull & Verify Image') {
+            steps {
+                script {
+                    docker.withRegistry("https://${DOCKER_REGISTRY}", 'docker-registry-credentials') {
+                        def image = docker.image("${DOCKER_REGISTRY}/${APP_NAME}:${params.IMAGE_TAG}")
+                        image.pull()
+                    }
+                }
+                sh """
+                    trivy image \
+                        --exit-code 1 \
+                        --severity CRITICAL \
+                        ${DOCKER_REGISTRY}/${APP_NAME}:${params.IMAGE_TAG}
+                """
+            }
+        }
+
+        stage('Database Migration') {
+            when {
+                expression { return params.ENVIRONMENT in ['staging', 'production'] }
+            }
+            steps {
+                withCredentials([
+                    string(credentialsId: "db-url-${params.ENVIRONMENT}", variable: 'DATABASE_URL')
+                ]) {
+                    sh '''
+                        docker run --rm \
+                            -e DATABASE_URL="${DATABASE_URL}" \
+                            -e FLASK_ENV=${ENVIRONMENT} \
+                            ${DOCKER_REGISTRY}/${APP_NAME}:${IMAGE_TAG} \
+                            flask db upgrade
+                    '''
+                }
+            }
+        }
+
+        stage('Deploy — Blue/Green') {
+            steps {
+                withCredentials([
+                    file(credentialsId: "k8s-kubeconfig-${params.ENVIRONMENT}", variable: 'KUBECONFIG')
+                ]) {
+                    script {
+                        def dryRunFlag = params.DRY_RUN ? '--dry-run=client' : ''
+
+                        sh """
+                            # Update the green deployment
+                            kubectl set image deployment/${APP_NAME}-green \
+                                ${APP_NAME}=${DOCKER_REGISTRY}/${APP_NAME}:${params.IMAGE_TAG} \
+                                -n ${KUBE_NAMESPACE} \
+                                ${dryRunFlag}
+
+                            # Wait for rollout
+                            kubectl rollout status deployment/${APP_NAME}-green \
+                                -n ${KUBE_NAMESPACE} \
+                                --timeout=300s
+                        """
+
+                        if (!params.DRY_RUN) {
+                            // Switch traffic to green
+                            sh """
+                                kubectl patch service ${APP_NAME} \
+                                    -n ${KUBE_NAMESPACE} \
+                                    -p '{"spec":{"selector":{"deployment":"green"}}}'
+                            """
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Smoke Tests') {
+            when {
+                expression { return !params.SKIP_SMOKE_TESTS && !params.DRY_RUN }
+            }
+            steps {
+                script {
+                    def baseUrl = getEnvironmentUrl(params.ENVIRONMENT)
+
+                    sh """
+                        # Health check
+                        curl -sf ${baseUrl}/health || exit 1
+
+                        # Readiness check
+                        curl -sf ${baseUrl}/health/ready || exit 1
+
+                        # API smoke test
+                        STATUS=\$(curl -s -o /dev/null -w '%{http_code}' ${baseUrl}/api/v1/accounts?page=1)
+                        if [ "\$STATUS" != "200" ]; then
+                            echo "Smoke test failed: GET /api/v1/accounts returned \$STATUS"
+                            exit 1
+                        fi
+                    """
+                }
+            }
+            post {
+                failure {
+                    script {
+                        echo "Smoke tests FAILED — initiating rollback..."
+                        rollbackDeployment(
+                            appName: APP_NAME,
+                            environment: params.ENVIRONMENT,
+                            namespace: KUBE_NAMESPACE,
+                        )
+                    }
+                }
+            }
+        }
+
+        stage('Cutover — Retire Old Blue') {
+            when {
+                expression { return !params.DRY_RUN }
+            }
+            steps {
+                withCredentials([
+                    file(credentialsId: "k8s-kubeconfig-${params.ENVIRONMENT}", variable: 'KUBECONFIG')
+                ]) {
+                    sh """
+                        # Scale down old blue deployment
+                        kubectl scale deployment/${APP_NAME}-blue \
+                            --replicas=0 \
+                            -n ${KUBE_NAMESPACE}
+
+                        # Relabel green as the new blue for next cycle
+                        kubectl label deployment/${APP_NAME}-green \
+                            deployment=blue --overwrite \
+                            -n ${KUBE_NAMESPACE}
+                    """
+                }
+            }
+        }
+
+        stage('Tag Release') {
+            when {
+                expression { return params.ENVIRONMENT == 'production' && !params.DRY_RUN }
+            }
+            steps {
+                script {
+                    def releaseTag = "release-${params.IMAGE_TAG}-${BUILD_NUMBER}"
+                    sh """
+                        docker tag \
+                            ${DOCKER_REGISTRY}/${APP_NAME}:${params.IMAGE_TAG} \
+                            ${DOCKER_REGISTRY}/${APP_NAME}:${releaseTag}
+                    """
+                    docker.withRegistry("https://${DOCKER_REGISTRY}", 'docker-registry-credentials') {
+                        docker.image("${DOCKER_REGISTRY}/${APP_NAME}:${releaseTag}").push()
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+        success {
+            notifySlack(
+                channel: env.SLACK_CHANNEL,
+                status: 'SUCCESS',
+                message: "Deployed *${APP_NAME}:${params.IMAGE_TAG}* to *${params.ENVIRONMENT}*.",
+            )
+            script {
+                if (params.ENVIRONMENT == 'production') {
+                    // Create Datadog deployment event
+                    withCredentials([string(credentialsId: 'datadog-api-key', variable: 'DD_API_KEY')]) {
+                        sh """
+                            curl -s -X POST "https://api.datadoghq.com/api/v1/events" \
+                                -H "DD-API-KEY: \${DD_API_KEY}" \
+                                -H "Content-Type: application/json" \
+                                -d '{
+                                    "title": "${APP_NAME} deployed to production",
+                                    "text": "Version ${params.IMAGE_TAG} deployed by Jenkins build ${BUILD_NUMBER}",
+                                    "tags": ["app:${APP_NAME}", "env:production"],
+                                    "alert_type": "success"
+                                }'
+                        """
+                    }
+                }
+            }
+        }
+        failure {
+            notifySlack(
+                channel: env.SLACK_CHANNEL,
+                status: 'FAILURE',
+                message: "FAILED to deploy *${APP_NAME}:${params.IMAGE_TAG}* to *${params.ENVIRONMENT}*. <${BUILD_URL}|View logs>",
+            )
+        }
+    }
+}
