@@ -43,6 +43,11 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: false
 
+permissions:
+  checks: write
+  pull-requests: write
+  contents: read
+
 env:
   APP_NAME: transactbank-api
   PYTHON_VERSION: '3.11'
@@ -406,6 +411,7 @@ jobs:
 
       - name: Send Slack notification
         uses: slackapi/slack-github-action@v2
+        continue-on-error: true
         with:
           webhook: ${{ secrets.SLACK_WEBHOOK_URL }}
           webhook-type: incoming-webhook
